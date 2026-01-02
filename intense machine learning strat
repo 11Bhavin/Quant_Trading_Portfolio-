@@ -1,0 +1,346 @@
+import warnings
+warnings.filterwarnings('ignore')
+
+# Need these packages
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import yfinance as yf
+import gymnasium as gym
+from gymnasium import spaces
+import torch
+import torch.nn as nn
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+import ta
+
+# Config
+UNIVERSE = [
+    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'ADBE', 'CRM', 'ORCL',
+    'JPM', 'BAC', 'GS', 'MS', 'C', 'WFC',
+    'UNH', 'JNJ', 'PFE', 'ABBV', 'MRK', 'TMO',
+    'WMT', 'PG', 'KO', 'PEP', 'COST', 'HD',
+    'XOM', 'CVX'
+]
+
+START = '2020-01-01'
+END = '2023-09-30'
+INITIAL_BALANCE = 100000
+TRANSACTION_COST_BPS = 5  # might be low for smaller accounts but using it for now
+
+# Download data
+def download_data(tickers, start, end):
+    print(f'Downloading data for {len(tickers)} tickers...')
+    data = yf.download(tickers, start=start, end=end, progress=False)
+    print(f'Got data from {start} to {end}')
+    return data
+
+# Feature engineering - probably too many features but trying everything
+class FeatureEngine:
+    def __init__(self, data):
+        self.data = data
+
+    def generate_all_features(self):
+        print('Building features...')
+
+        close = self.data['Close']
+        high = self.data['High']
+        low = self.data['Low']
+        volume = self.data['Volume']
+
+        features_df = pd.DataFrame(index=close.index)
+
+        for ticker in close.columns:
+            c = close[ticker]
+            h = high[ticker]
+            l = low[ticker]
+            v = volume[ticker]
+
+            # Momentum - multiple periods to catch different trends
+            for period in [5, 10, 21, 50]:
+                features_df[f'{ticker}_ret_{period}'] = c.pct_change(period)
+                features_df[f'{ticker}_ma_ratio_{period}'] = c / c.rolling(period).mean()
+
+            # Vol
+            for window in [10, 21]:
+                features_df[f'{ticker}_vol_{window}'] = c.pct_change().rolling(window).std()
+
+            # TA indicators - these might be redundant with momentum but whatever
+            features_df[f'{ticker}_rsi'] = ta.momentum.RSIIndicator(c, window=14).rsi()
+            features_df[f'{ticker}_macd'] = ta.trend.MACD(c).macd()
+            features_df[f'{ticker}_bb_pband'] = ta.volatility.BollingerBands(c).bollinger_pband()
+            features_df[f'{ticker}_adx'] = ta.trend.ADXIndicator(h, l, c).adx()
+            features_df[f'{ticker}_atr_ratio'] = ta.volatility.AverageTrueRange(h, l, c).average_true_range() / c
+
+            # Volume relative to recent avg
+            features_df[f'{ticker}_vol_ratio'] = v / v.rolling(21).mean()
+
+        # Fill NaNs - probably not the best way but it works
+        features_df = features_df.ffill().fillna(0)
+
+        # Clip extremes so one outlier doesn't wreck everything
+        features_df = features_df.clip(-10, 10)
+
+        print(f'Generated {len(features_df.columns)} features (probably way too many)')
+        return features_df
+
+# Custom gym environment for trading
+# TODO: This needs proper train/validation split - right now it's all in-sample
+class TradingEnvironment(gym.Env):
+    def __init__(self, data, features, initial_balance=INITIAL_BALANCE,
+                 transaction_cost_bps=TRANSACTION_COST_BPS):
+        super(TradingEnvironment, self).__init__()
+
+        self.data = data
+        self.features = features
+        self.initial_balance = initial_balance
+        self.transaction_cost_bps = transaction_cost_bps
+        self.tickers = data['Close'].columns.tolist()
+
+        # Action: portfolio weights for each asset
+        self.action_space = spaces.Box(
+            low=0, high=1, shape=(len(self.tickers),), dtype=np.float32
+        )
+
+        # Observation: features + current portfolio state
+        n_features = len(self.features.columns)
+        n_portfolio_state = len(self.tickers) + 2  # positions + cash ratio + total value
+
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf,
+            shape=(n_features + n_portfolio_state,), dtype=np.float32
+        )
+
+        self.reset()
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.current_step = 100  # skip first 100 days for feature warmup
+        self.balance = self.initial_balance
+        self.shares_held = np.zeros(len(self.tickers))
+        self.total_value = self.initial_balance
+        self.total_trades = 0
+        self.total_transaction_costs = 0
+
+        return self._get_observation(), {}
+
+    def _get_observation(self):
+        # Market features at current timestep
+        market_features = self.features.iloc[self.current_step].values.astype(np.float32)
+
+        # Current portfolio state
+        current_prices = self.data['Close'].iloc[self.current_step].values
+        portfolio_weights = (self.shares_held * current_prices) / (self.total_value + 1e-10)
+        cash_weight = self.balance / (self.total_value + 1e-10)
+        total_value_norm = self.total_value / self.initial_balance
+
+        portfolio_state = np.concatenate([
+            portfolio_weights,
+            [cash_weight, total_value_norm]
+        ]).astype(np.float32)
+
+        return np.concatenate([market_features, portfolio_state])
+
+    def step(self, action):
+        current_prices = self.data['Close'].iloc[self.current_step].values
+
+        # Normalize action to sum to 1
+        action = action / (action.sum() + 1e-10)
+
+        # Current portfolio value
+        portfolio_value = self.balance + np.sum(self.shares_held * current_prices)
+
+        # Target positions based on action
+        target_values = portfolio_value * action
+        current_values = self.shares_held * current_prices
+
+        # Execute trades with transaction costs
+        transaction_cost = 0
+        for i in range(len(self.tickers)):
+            value_diff = target_values[i] - current_values[i]
+
+            # Only trade if difference > 1% of portfolio (avoid tiny trades)
+            if abs(value_diff) > portfolio_value * 0.01:
+                trade_value = abs(value_diff)
+                transaction_cost += trade_value * (self.transaction_cost_bps / 10000)
+
+                if value_diff > 0:  # Buy
+                    shares_to_buy = min(value_diff, self.balance * 0.95) / current_prices[i]
+                    self.shares_held[i] += shares_to_buy
+                    self.balance -= shares_to_buy * current_prices[i]
+                    self.total_trades += 1
+                elif value_diff < 0:  # Sell
+                    shares_to_sell = min(abs(value_diff), current_values[i]) / current_prices[i]
+                    self.shares_held[i] -= shares_to_sell
+                    self.balance += shares_to_sell * current_prices[i]
+                    self.total_trades += 1
+
+        self.balance -= transaction_cost
+        self.total_transaction_costs += transaction_cost
+
+        # Move forward
+        self.current_step += 1
+
+        # New portfolio value
+        new_prices = self.data['Close'].iloc[self.current_step].values
+        new_portfolio_value = self.balance + np.sum(self.shares_held * new_prices)
+
+        # Reward calculation
+        # NOTE: This reward function is experimental - penalizing volatility but might be too aggressive
+        returns = (new_portfolio_value - portfolio_value) / portfolio_value
+        reward = returns - 0.5 * abs(returns)  # trying to encourage steady gains over big swings
+
+        # Episode termination
+        terminated = self.current_step >= len(self.features) - 1 or new_portfolio_value <= self.initial_balance * 0.5
+        truncated = False
+
+        self.total_value = new_portfolio_value
+
+        return self._get_observation(), reward, terminated, truncated, {}
+
+# Train PPO agent
+# Using pretty standard hyperparams but learning rate might need tuning
+def train_rl_agent(env, timesteps=100000):
+    print(f'Training PPO for {timesteps:,} steps...')
+    print('Using lr=0.0001, might be too conservative but being cautious')
+
+    model = PPO(
+        'MlpPolicy',
+        env,
+        verbose=1,
+        learning_rate=0.0001,
+        n_steps=2048,
+        batch_size=256,
+        n_epochs=20,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,
+        policy_kwargs=dict(net_arch=[256, 256, 128])
+    )
+
+    model.learn(total_timesteps=timesteps)
+    print('Training done')
+
+    return model
+
+# Main execution
+if __name__ == '__main__':
+    print('='*60)
+    print('Multi-Asset RL Portfolio Agent')
+    print('='*60)
+    print(f'{len(UNIVERSE)} assets, {TRANSACTION_COST_BPS}bps transaction cost')
+    print('NOTE: No proper train/validation split yet - this is all in-sample')
+    print('='*60)
+
+    # Get data
+    data = download_data(UNIVERSE, START, END)
+
+    # Build features
+    feature_engine = FeatureEngine(data)
+    features = feature_engine.generate_all_features()
+
+    # Train RL agent
+    print('\nSetting up training environment...')
+    env = TradingEnvironment(data, features)
+    rl_agent = train_rl_agent(env, timesteps=100000)
+
+    # Backtest
+    print('\n' + '='*60)
+    print('Running backtest...')
+    print('='*60)
+
+    env_test = TradingEnvironment(data, features)
+    obs, _ = env_test.reset()
+    rl_values = [INITIAL_BALANCE]
+
+    done = False
+    while not done:
+        action, _ = rl_agent.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, _ = env_test.step(action)
+        rl_values.append(env_test.total_value)
+
+        if terminated or truncated:
+            done = True
+            break
+
+    rl_results = pd.Series(rl_values, index=features.index[100:100+len(rl_values)])
+
+    # Equal weight benchmark
+    benchmark = data['Close'].iloc[100:].mean(axis=1) / data['Close'].iloc[100].mean() * INITIAL_BALANCE
+
+    # Plot results
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+    # Portfolio value over time
+    axes[0, 0].plot(rl_results, label='RL Agent', linewidth=2, color='steelblue')
+    axes[0, 0].plot(benchmark, label='Equal Weight', linewidth=2, alpha=0.7, color='coral')
+    axes[0, 0].axhline(INITIAL_BALANCE, color='gray', linestyle='--', alpha=0.5, label='Starting Capital')
+    axes[0, 0].set_title('Portfolio Value', fontsize=13, fontweight='bold')
+    axes[0, 0].set_ylabel('Value ($)', fontsize=10)
+    axes[0, 0].legend(fontsize=9)
+    axes[0, 0].grid(alpha=0.3)
+
+    # Returns distribution
+    rl_returns = rl_results.pct_change().dropna()
+    axes[0, 1].hist(rl_returns, bins=50, alpha=0.7, color='steelblue', edgecolor='black')
+    axes[0, 1].axvline(0, color='red', linestyle='--', linewidth=1)
+    axes[0, 1].set_title('Daily Returns Distribution', fontsize=13, fontweight='bold')
+    axes[0, 1].set_xlabel('Return', fontsize=10)
+    axes[0, 1].set_ylabel('Frequency', fontsize=10)
+    axes[0, 1].grid(alpha=0.3)
+
+    # Drawdown
+    rl_dd = (rl_results / rl_results.cummax() - 1) * 100
+    bench_dd = (benchmark / benchmark.cummax() - 1) * 100
+    axes[1, 0].fill_between(rl_dd.index, rl_dd.values, 0, alpha=0.5, color='steelblue', label='RL Agent')
+    axes[1, 0].fill_between(bench_dd.index, bench_dd.values, 0, alpha=0.4, color='coral', label='Benchmark')
+    axes[1, 0].set_title('Drawdown', fontsize=13, fontweight='bold')
+    axes[1, 0].set_ylabel('Drawdown (%)', fontsize=10)
+    axes[1, 0].legend(fontsize=9)
+    axes[1, 0].grid(alpha=0.3)
+
+    # Rolling Sharpe (30-day)
+    rl_rolling_sharpe = (rl_results.pct_change().rolling(30).mean() / 
+                         rl_results.pct_change().rolling(30).std() * np.sqrt(252))
+    bench_rolling_sharpe = (benchmark.pct_change().rolling(30).mean() / 
+                            benchmark.pct_change().rolling(30).std() * np.sqrt(252))
+    axes[1, 1].plot(rl_rolling_sharpe, label='RL Agent', linewidth=2, color='steelblue')
+    axes[1, 1].plot(bench_rolling_sharpe, label='Benchmark', linewidth=2, alpha=0.7, color='coral')
+    axes[1, 1].axhline(0, color='gray', linestyle='--', alpha=0.5)
+    axes[1, 1].set_title('Rolling 30-Day Sharpe Ratio', fontsize=13, fontweight='bold')
+    axes[1, 1].set_ylabel('Sharpe', fontsize=10)
+    axes[1, 1].legend(fontsize=9)
+    axes[1, 1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Performance stats
+    print('\n' + '='*60)
+    print('Performance Summary')
+    print('='*60)
+
+    rl_return = (rl_results.iloc[-1] - INITIAL_BALANCE) / INITIAL_BALANCE
+    bench_return = (benchmark.iloc[-1] - INITIAL_BALANCE) / INITIAL_BALANCE
+
+    rl_vol = rl_results.pct_change().std() * np.sqrt(252)
+    bench_vol = benchmark.pct_change().std() * np.sqrt(252)
+
+    rl_sharpe = (rl_return / rl_vol) if rl_vol > 0 else 0
+    bench_sharpe = (bench_return / bench_vol) if bench_vol > 0 else 0
+
+    max_dd_rl = rl_dd.min()
+    max_dd_bench = bench_dd.min()
+
+    print(f"{'Metric':<25} {'RL Agent':>12} {'Benchmark':>12} {'Diff':>10}")
+    print('-'*60)
+    print(f"{'Total Return':<25} {rl_return:>11.2%} {bench_return:>11.2%} {(rl_return-bench_return):>9.2%}")
+    print(f"{'Annual Volatility':<25} {rl_vol:>11.2%} {bench_vol:>11.2%} {(rl_vol-bench_vol):>9.2%}")
+    print(f"{'Sharpe Ratio':<25} {rl_sharpe:>11.2f} {bench_sharpe:>11.2f} {(rl_sharpe-bench_sharpe):>9.2f}")
+    print(f"{'Max Drawdown':<25} {max_dd_rl:>11.2f}% {max_dd_bench:>11.2f}% {(max_dd_rl-max_dd_bench):>9.2f}%")
+    print(f"{'Total Trades':<25} {env_test.total_trades:>11,}")
+    print(f"{'Transaction Costs':<25} ${env_test.total_transaction_costs:>10,.2f}")
+    print('='*60)
+
+    print('\nDone. Remember this is all in-sample - need to add proper validation.')
