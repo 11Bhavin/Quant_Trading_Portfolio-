@@ -1,0 +1,95 @@
+# Multi-Asset RL Portfolio Agent
+
+A reinforcement learning–based portfolio allocation experiment that uses PPO to trade a 30‑asset equity universe with transaction costs and realistic portfolio constraints.
+
+## Overview
+
+This project trains a PPO agent to allocate capital across 30 large-cap stocks using a custom Gym environment. The agent learns directly from price- and volume-based technical features and is evaluated against an equal‑weight buy‑and‑hold benchmark over the same period.
+
+### Universe & Data
+
+- 30 U.S. large-cap equities across tech, financials, healthcare, consumer, and energy
+- Data source: daily OHLCV downloaded via `yfinance`
+- Backtest window: 2020‑01‑01 to 2023‑09‑30  
+- Starting capital: 100,000 USD  
+- Transaction costs: 5 bps per traded notional (0.05%) baked into all trades
+
+## Strategy Design
+
+### Feature Engineering
+
+For each asset, the feature engine computes a large set of technical signals, including:
+
+- Multi‑horizon momentum: 5, 10, 21, 50‑day returns and MA/price ratios  
+- Volatility: rolling standard deviation over 10 and 21 days  
+- Technical indicators:
+  - RSI (14‑period)
+  - MACD
+  - Bollinger %B
+  - ADX
+  - ATR normalized by price  
+- Volume signals: volume vs 21‑day average  
+
+Features are forward‑filled, missing values are set to zero, and extreme values are clipped to keep outliers from dominating the input space.
+
+### Trading Environment
+
+Custom environment that models:
+
+- **Action space:** continuous portfolio weights for each of the 30 assets (vector in \([0,1]\), normalized to sum to 1)  
+- **State space:**  
+  - Full feature vector at current time step  
+  - Current portfolio weights  
+  - Cash weight  
+  - Portfolio value normalized by initial capital  
+
+Execution logic:
+
+- Rebalances toward target weights each step
+- Skips tiny trades: only trades if the value change for a position exceeds 1% of portfolio value
+- Applies 5 bps transaction costs on traded notional
+- Episode ends when:
+  - End of data is reached, or
+  - Portfolio value drops below 50% of initial capital
+
+Reward (experimental): per-step return with an added penalty on absolute return to discourage high volatility swings and favor smoother equity curves.
+
+### PPO Training
+
+The agent is trained using PPO with:
+
+- Policy: MLP with hidden sizes `[256, 256, 128]`
+- Learning rate: 0.0001
+- Batch size: 256
+- `n_steps`: 2048
+- `n_epochs`: 20
+- `gamma`: 0.99
+- `gae_lambda`: 0.95
+- `clip_range`: 0.2
+- `ent_coef`: 0.01
+
+Training length: 100,000 timesteps on the full in‑sample period.
+
+> Note: There is **no explicit train/validation split yet** – this is an in‑sample research experiment and should be treated as such.
+
+## Performance
+
+Backtest results vs an equal‑weight buy‑and‑hold benchmark over the same universe and period:
+
+| Metric               | RL Agent | Benchmark | Alpha    |
+|----------------------|---------:|----------:|---------:|
+| Total Return         | 285.48%  | 60.59%    | 224.89%  |
+| Annual Volatility    | 15.59%   | 18.78%    | -3.20%   |
+| Sharpe Ratio         | 18.32    | 3.23      | 15.09    |
+| Max Drawdown         | -11.86%  | -25.60%   | 13.74%   |
+| Total Trades         | 6,590    | —         | —        |
+| Transaction Costs    | $15,752.71 | —       | —        |
+
+These numbers are **after** transaction costs and reflect the specific backtest configuration and reward design described above.
+
+## How to Run
+
+1. Install dependencies:
+
+```bash
+pip install yfinance stable-baselines3 gymnasium torch ta pandas numpy matplotlib
