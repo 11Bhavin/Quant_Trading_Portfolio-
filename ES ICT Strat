@@ -1,0 +1,526 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import time
+import warnings
+import os
+warnings.filterwarnings('ignore')
+
+print("ES futures paper trader - ICT methodology")
+print("E-mini S&P 500 | $50/point | 23hr trading\n")
+
+class ESAutoTrader:
+    """
+    Automated ES futures trader using Fair Value Gaps
+    Multi-timeframe: 1H structure -> 5M entries
+    """
+    def __init__(self, account_size=100000, risk_per_trade=0.01):
+        self.account_size = account_size
+        self.risk_per_trade = risk_per_trade
+        self.max_trade_risk = account_size * risk_per_trade
+
+        # ES contract specs
+        self.contract_multiplier = 50  # $50 per point
+        self.tick_size = 0.25
+        self.tick_value = 12.50
+
+        # Filters - tuned through observation but still subjective
+        self.filters = {
+            'use_killzone': True,
+            'use_volume_filter': True,
+            'fvg_gap_threshold': 0.0015,  # 15 bps minimum gap
+            'volume_threshold': 0.8,
+            'risk_min': 0.0005,
+            'risk_max': 0.015
+        }
+
+        # Active positions
+        self.positions = []
+
+        # Trade journal
+        self.journal_file = 'es_trading_journal.csv'
+        self.setup_journal()
+
+        # Prevent duplicate entries
+        self.seen_setups = set()
+
+    def setup_journal(self):
+        """Initialize CSV journal if doesn't exist"""
+        if not os.path.exists(self.journal_file):
+            df = pd.DataFrame(columns=[
+                'Trade_ID', 'Entry_Time', 'Direction', 'Entry', 'Stop', 'Target',
+                'Risk_Points', 'Contracts', 'Status', 'Exit', 'Exit_Time',
+                'PnL', 'Exit_Reason', 'Session', 'Duration_Minutes'
+            ])
+            df.to_csv(self.journal_file, index=False)
+
+    def get_session(self, dt=None):
+        """
+        Determine current trading session and if in killzone
+
+        ES trades 23/5 (closed 5-6pm EST for settlement)
+
+        Killzones (ICT concept):
+        - NY AM: 9:30-11:30am EST (best momentum)
+        - NY PM: 1:30-3:30pm EST (afternoon flow)
+        - London Open: 2-5am EST (European open)
+        - Asian: 6-8pm EST (Tokyo open)
+
+        NOTE: Killzone timing is discretionary; these are my interpretations
+        """
+        if dt is None:
+            dt = datetime.now()
+
+        hour = dt.hour
+        minute = dt.minute
+
+        # New York session (best liquidity)
+        if (hour == 9 and minute >= 30) or (10 <= hour < 16):
+            if (hour == 9 and minute >= 30) or (hour == 10) or (hour == 11 and minute < 30):
+                return True, 'NY_AM'
+            elif (hour == 13 and minute >= 30) or (hour == 14) or (hour == 15 and minute < 30):
+                return True, 'NY_PM'
+            else:
+                return False, 'NY_OTHER'
+
+        # London session
+        elif 2 <= hour < 9:
+            if 2 <= hour < 5:
+                return True, 'LONDON_OPEN'
+            else:
+                return False, 'LONDON_OTHER'
+
+        # Asian session
+        elif hour >= 18 or hour < 2:
+            if (hour == 18) or (hour == 19) or (hour == 20):
+                return True, 'ASIAN'
+            else:
+                return False, 'ASIAN_OTHER'
+
+        return False, 'CLOSED'
+
+    def is_market_open(self):
+        """Check if ES is trading (23/5 - closed 5-6pm EST)"""
+        now = datetime.now()
+
+        # Weekend
+        if now.weekday() == 6:  # Sunday
+            return now.hour >= 18
+        elif now.weekday() == 5:  # Saturday
+            return False
+
+        # Weekday - only closed during settlement
+        hour = now.hour
+        if hour == 17:
+            return False
+
+        return True
+
+    def detect_fvg(self, df, bullish=True):
+        """
+        Detect Fair Value Gaps
+
+        Bullish FVG: gap between candle[i-2].high and candle[i].low
+        Bearish FVG: gap between candle[i-2].low and candle[i].high
+
+        FVG logic is discretionary by nature; rules are intentionally simple
+        """
+        fvgs = []
+
+        for i in range(2, len(df)):
+            if bullish:
+                gap_size = df['Low'].iloc[i] - df['High'].iloc[i-2]
+                if gap_size > 0 and gap_size / df['Close'].iloc[i] >= self.filters['fvg_gap_threshold']:
+                    fvgs.append({
+                        'time': df.index[i],
+                        'top': df['Low'].iloc[i],
+                        'bottom': df['High'].iloc[i-2],
+                        'mid': (df['Low'].iloc[i] + df['High'].iloc[i-2]) / 2,
+                        'type': 'bullish'
+                    })
+            else:
+                gap_size = df['Low'].iloc[i-2] - df['High'].iloc[i]
+                if gap_size > 0 and gap_size / df['Close'].iloc[i] >= self.filters['fvg_gap_threshold']:
+                    fvgs.append({
+                        'time': df.index[i],
+                        'top': df['Low'].iloc[i-2],
+                        'bottom': df['High'].iloc[i],
+                        'mid': (df['Low'].iloc[i-2] + df['High'].iloc[i]) / 2,
+                        'type': 'bearish'
+                    })
+
+        return fvgs
+
+    def check_volume(self, df, lookback=20):
+        """Volume filter - above 80% of recent average"""
+        if len(df) < lookback:
+            return True
+
+        recent = df.tail(lookback)
+        current_vol = recent['Volume'].iloc[-1]
+        avg_vol = recent['Volume'].mean()
+        ratio = current_vol / avg_vol if avg_vol > 0 else 1.0
+
+        return ratio >= self.filters['volume_threshold']
+
+    def calculate_position_size(self, risk_points):
+        """
+        Calculate contract size based on dollar risk
+
+        Risk per contract = points × $50
+        Max contracts = max_trade_risk / risk_per_contract
+        """
+        risk_per_contract = risk_points * self.contract_multiplier
+        contracts = int(self.max_trade_risk / risk_per_contract)
+
+        # Minimum 1 contract
+        if contracts < 1:
+            contracts = 1
+
+        return contracts
+
+    def scan_for_entry(self):
+        """
+        Scan for FVG alignment across timeframes
+
+        Logic:
+        1. Find 1H FVG (HTF bias)
+        2. Find 5M FVG (LTF entry)
+        3. 5M FVG must form after 1H FVG
+        4. Price must be near 5M FVG midpoint
+        5. Volume must be adequate
+
+        TODO: Add order flow confirmation (need tick data)
+        """
+        # Check if in killzone
+        in_kz, session_name = self.get_session()
+        if not in_kz:
+            return None
+
+        # Download data
+        # NOTE: Using ES=F (futures) but falls back to SPY if unavailable
+        # Correlation is imperfect; used only for structure timing
+        try:
+            ticker = yf.Ticker("ES=F")
+            try:
+                df_1h = ticker.history(period="5d", interval="1h")
+                df_5m = ticker.history(period="1d", interval="5m")
+            except:
+                # Fallback to SPY
+                ticker = yf.Ticker("SPY")
+                df_1h = ticker.history(period="5d", interval="1h")
+                df_5m = ticker.history(period="1d", interval="5m")
+        except:
+            return None
+
+        # Volume check
+        if not self.check_volume(df_5m):
+            return None
+
+        # Detect FVGs on both timeframes
+        fvgs_1h_bull = self.detect_fvg(df_1h, bullish=True)
+        fvgs_1h_bear = self.detect_fvg(df_1h, bullish=False)
+        fvgs_5m_bull = self.detect_fvg(df_5m, bullish=True)
+        fvgs_5m_bear = self.detect_fvg(df_5m, bullish=False)
+
+        current_price = df_5m['Close'].iloc[-1]
+        current_time = df_5m.index[-1]
+
+        # LONG setup: bullish 1H FVG + bullish 5M FVG
+        for fvg_1h in fvgs_1h_bull[-3:]:  # Last 3 hourly FVGs
+            for fvg_5m in fvgs_5m_bull[-5:]:  # Last 5 5min FVGs
+                # 5M FVG must form after 1H FVG
+                if fvg_5m['time'] > fvg_1h['time']:
+                    # Price near 5M FVG midpoint
+                    if abs(current_price - fvg_5m['mid']) / current_price < 0.002:
+                        # Confirm bullish candle
+                        last_candle = df_5m.iloc[-1]
+                        if last_candle['Close'] > last_candle['Open']:
+                            entry = current_price
+                            stop = fvg_5m['bottom'] - 0.50  # buffer below FVG
+                            risk_points = entry - stop
+
+                            # Risk checks
+                            if risk_points > 0 and self.filters['risk_min'] < (risk_points/entry) < self.filters['risk_max']:
+                                target = entry + (risk_points * 2.0)  # 2R target
+                                contracts = self.calculate_position_size(risk_points)
+
+                                # Prevent duplicates
+                                setup_key = f"LONG_{entry:.2f}_{current_time.strftime('%Y%m%d%H%M')}"
+                                if setup_key not in self.seen_setups:
+                                    self.seen_setups.add(setup_key)
+
+                                    return {
+                                        'Direction': 'LONG',
+                                        'Entry': entry,
+                                        'Stop': stop,
+                                        'Target': target,
+                                        'Risk_Points': risk_points,
+                                        'Contracts': contracts,
+                                        'Session': session_name,
+                                        'Entry_Time': current_time
+                                    }
+
+        # SHORT setup: bearish 1H FVG + bearish 5M FVG
+        for fvg_1h in fvgs_1h_bear[-3:]:
+            for fvg_5m in fvgs_5m_bear[-5:]:
+                if fvg_5m['time'] > fvg_1h['time']:
+                    if abs(current_price - fvg_5m['mid']) / current_price < 0.002:
+                        last_candle = df_5m.iloc[-1]
+                        if last_candle['Close'] < last_candle['Open']:
+                            entry = current_price
+                            stop = fvg_5m['top'] + 0.50
+                            risk_points = stop - entry
+
+                            if risk_points > 0 and self.filters['risk_min'] < (risk_points/entry) < self.filters['risk_max']:
+                                target = entry - (risk_points * 2.0)
+                                contracts = self.calculate_position_size(risk_points)
+
+                                setup_key = f"SHORT_{entry:.2f}_{current_time.strftime('%Y%m%d%H%M')}"
+                                if setup_key not in self.seen_setups:
+                                    self.seen_setups.add(setup_key)
+
+                                    return {
+                                        'Direction': 'SHORT',
+                                        'Entry': entry,
+                                        'Stop': stop,
+                                        'Target': target,
+                                        'Risk_Points': risk_points,
+                                        'Contracts': contracts,
+                                        'Session': session_name,
+                                        'Entry_Time': current_time
+                                    }
+
+        return None
+
+    def enter_trade(self, setup):
+        """Log and track new position"""
+        trade_id = f"ES{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+        position = {
+            'Trade_ID': trade_id,
+            'Entry_Time': setup['Entry_Time'],
+            'Direction': setup['Direction'],
+            'Entry': setup['Entry'],
+            'Stop': setup['Stop'],
+            'Target': setup['Target'],
+            'Risk_Points': setup['Risk_Points'],
+            'Contracts': setup['Contracts'],
+            'Session': setup['Session'],
+            'Status': 'OPEN'
+        }
+
+        self.positions.append(position)
+
+        # Calculate dollar amounts
+        dollar_risk = setup['Risk_Points'] * self.contract_multiplier * setup['Contracts']
+        dollar_target = dollar_risk * 2
+
+        print(f"\nES TRADE ENTERED: {trade_id}")
+        print(f"Time: {setup['Entry_Time']}")
+        print(f"Session: {setup['Session']}")
+        print(f"Direction: {setup['Direction']}")
+        print(f"Entry: {setup['Entry']:.2f}")
+        print(f"Stop: {setup['Stop']:.2f} | Target: {setup['Target']:.2f}")
+        print(f"Risk: {setup['Risk_Points']:.2f} pts (${dollar_risk:,.0f})")
+        print(f"Contracts: {setup['Contracts']}")
+        print(f"Target: ${dollar_target:,.0f} (+2R)")
+
+        return trade_id
+
+    def manage_positions(self):
+        """Check stops and targets for open positions"""
+        if len(self.positions) == 0:
+            return
+
+        # Get current price
+        try:
+            ticker = yf.Ticker("ES=F")
+            try:
+                current_data = ticker.history(period="1d", interval="1m")
+            except:
+                ticker = yf.Ticker("SPY")
+                current_data = ticker.history(period="1d", interval="1m")
+
+            current_price = current_data['Close'].iloc[-1]
+            current_time = current_data.index[-1]
+        except:
+            return
+
+        for position in self.positions[:]:
+            if position['Status'] != 'OPEN':
+                continue
+
+            direction = position['Direction']
+            stop = position['Stop']
+            target = position['Target']
+
+            exit_price = None
+            exit_reason = None
+
+            if direction == 'LONG':
+                if current_price <= stop:
+                    exit_price = stop
+                    exit_reason = 'STOP_LOSS'
+                elif current_price >= target:
+                    exit_price = target
+                    exit_reason = 'TARGET'
+            else:  # SHORT
+                if current_price >= stop:
+                    exit_price = stop
+                    exit_reason = 'STOP_LOSS'
+                elif current_price <= target:
+                    exit_price = target
+                    exit_reason = 'TARGET'
+
+            if exit_price is not None:
+                self.exit_trade(position, exit_price, exit_reason, current_time)
+
+    def exit_trade(self, position, exit_price, exit_reason, exit_time):
+        """Close position and log to journal"""
+        # Calculate P&L in points
+        if position['Direction'] == 'LONG':
+            pnl_points = exit_price - position['Entry']
+        else:
+            pnl_points = position['Entry'] - exit_price
+
+        # Convert to dollars
+        pnl = pnl_points * self.contract_multiplier * position['Contracts']
+
+        # Duration
+        duration = (exit_time - position['Entry_Time']).total_seconds() / 60
+
+        # Update position
+        position['Status'] = 'CLOSED'
+        position['Exit'] = exit_price
+        position['Exit_Time'] = exit_time
+        position['PnL'] = pnl
+        position['Exit_Reason'] = exit_reason
+        position['Duration_Minutes'] = duration
+
+        # Log to CSV
+        journal_entry = {
+            'Trade_ID': position['Trade_ID'],
+            'Entry_Time': position['Entry_Time'].strftime('%Y-%m-%d %H:%M:%S'),
+            'Direction': position['Direction'],
+            'Entry': position['Entry'],
+            'Stop': position['Stop'],
+            'Target': position['Target'],
+            'Risk_Points': position['Risk_Points'],
+            'Contracts': position['Contracts'],
+            'Status': 'CLOSED',
+            'Exit': exit_price,
+            'Exit_Time': exit_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'PnL': pnl,
+            'Exit_Reason': exit_reason,
+            'Session': position['Session'],
+            'Duration_Minutes': duration
+        }
+
+        df = pd.read_csv(self.journal_file)
+        df = pd.concat([df, pd.DataFrame([journal_entry])], ignore_index=True)
+        df.to_csv(self.journal_file, index=False)
+
+        # Calculate R-multiple
+        r_multiple = pnl / (position['Risk_Points'] * self.contract_multiplier * position['Contracts'])
+
+        result = "WIN" if pnl > 0 else "LOSS"
+        print(f"\nES TRADE CLOSED: {position['Trade_ID']} ({result})")
+        print(f"Exit: {exit_price:.2f} | Reason: {exit_reason}")
+        print(f"P&L: ${pnl:,.2f} ({r_multiple:+.2f}R)")
+        print(f"Duration: {duration:.0f} min")
+
+        # Update account
+        self.account_size += pnl
+        self.max_trade_risk = self.account_size * self.risk_per_trade
+
+    def show_stats(self):
+        """Print performance summary"""
+        df = pd.read_csv(self.journal_file)
+        if len(df) == 0:
+            return
+
+        winners = df[df['PnL'] > 0]
+        losers = df[df['PnL'] < 0]
+
+        print(f"\n{'='*60}")
+        print("ES Performance Summary")
+        print('='*60)
+        print(f"Total Trades: {len(df)}")
+        print(f"Winners: {len(winners)} ({len(winners)/len(df)*100:.1f}%)")
+        print(f"Losers: {len(losers)} ({len(losers)/len(df)*100:.1f}%)")
+        print(f"\nTotal P&L: ${df['PnL'].sum():,.2f}")
+        print(f"Account: ${self.account_size:,.2f}")
+
+        # By session
+        print(f"\nPerformance by Session:")
+        for session in df['Session'].unique():
+            subset = df[df['Session'] == session]
+            wins = len(subset[subset['PnL'] > 0])
+            print(f"  {session:12} {len(subset):2} trades | {wins:2} wins | ${subset['PnL'].sum():>8,.0f}")
+
+    def run(self, duration_hours=4):
+        """Main execution loop"""
+        print(f"\nES Auto Trader Started")
+        print(f"Duration: {duration_hours} hours")
+        print(f"Account: ${self.account_size:,.2f}")
+        print(f"Risk: {self.risk_per_trade*100:.0f}% per trade")
+        print(f"Contract: $50 per point")
+        print(f"Killzones: NY AM/PM, London Open, Asian\n")
+
+        start_time = datetime.now()
+        end_time = start_time + timedelta(hours=duration_hours)
+        scan_interval = 60
+
+        while datetime.now() < end_time:
+            # Check if market open
+            if not self.is_market_open():
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ES closed (5-6pm settlement). Waiting...")
+                time.sleep(300)
+                continue
+
+            # Manage existing positions
+            self.manage_positions()
+
+            # Scan for entries if flat
+            if len([p for p in self.positions if p['Status'] == 'OPEN']) == 0:
+                in_kz, session = self.get_session()
+                if in_kz:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Scanning {session}...", end='')
+                    setup = self.scan_for_entry()
+                    if setup:
+                        print(f" Setup found")
+                        self.enter_trade(setup)
+                    else:
+                        print(f" Clear")
+                else:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Outside killzone ({session})")
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Managing position...")
+
+            # Show stats every 15 min
+            if len(self.positions) > 0 and datetime.now().minute % 15 == 0:
+                self.show_stats()
+
+            time.sleep(scan_interval)
+
+        print(f"\nES Trader Stopped")
+        self.show_stats()
+
+if __name__ == "__main__":
+    print("ES Futures Paper Trading")
+    print("$50 per point | 23hr trading | ICT FVG methodology\n")
+
+    bot = ESAutoTrader(account_size=100000, risk_per_trade=0.01)
+
+    print("Starting in 5 seconds...")
+    print("Press Ctrl+C to stop")
+    time.sleep(5)
+
+    try:
+        bot.run(duration_hours=4)
+    except KeyboardInterrupt:
+        print("\nStopped by user")
+        bot.show_stats()
+        print(f"\nJournal saved: {bot.journal_file}")
