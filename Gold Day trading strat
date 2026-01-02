@@ -1,0 +1,505 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import sqlite3
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+# Risk parameters
+CAPITAL = 10000
+MAX_DAILY_LOSS = 0.06
+MAX_TOTAL_LOSS = 0.12
+PROFIT_TARGET = 0.10
+CONTRACT_VALUE = 50
+RISK_PER_TRADE = 0.02
+
+# Strategy parameters from GA optimization
+# NOTE: These were evolved over 15 generations but might need adjustment for different market regimes
+EMA_FAST = 7
+EMA_SLOW = 18
+EMA_TREND = 45
+RSI_PERIOD = 12
+ATR_MULTIPLIER = 1.8
+TARGET_MULTIPLIER = 4.0
+CONFIDENCE_THRESHOLD = 0.55  # experimentally found this balance precision/recall
+
+def calculate_atr(df, period):
+    """ATR for stop placement - using Wilder's method"""
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
+
+def calculate_rsi(df, period):
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_macd(df):
+    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+    macd = exp1 - exp2
+    signal = macd.ewm(span=9, adjust=False).mean()
+    histogram = macd - signal
+    return macd, signal, histogram
+
+def calculate_adx(df, period):
+    """ADX to filter choppy markets - only trade when > 20-25"""
+    high = df['High']
+    low = df['Low']
+
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm < 0] = 0
+
+    tr = calculate_atr(df, period)
+    plus_di = 100 * (plus_dm.rolling(window=period).mean() / tr)
+    minus_di = 100 * (minus_dm.rolling(window=period).mean() / tr)
+
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+    adx = dx.rolling(window=period).mean()
+    return adx
+
+def calculate_stochastic(df, period=14):
+    low_min = df['Low'].rolling(window=period).min()
+    high_max = df['High'].rolling(window=period).max()
+    k = 100 * (df['Close'] - low_min) / (high_max - low_min)
+    d = k.rolling(window=3).mean()
+    return k, d
+
+def create_features(df):
+    """Build feature matrix
+    NOTE: Many of these are correlated - tree models handle redundancy reasonably well"""
+    df = df.copy()
+
+    # EMAs
+    df['ema_fast'] = df['Close'].ewm(span=EMA_FAST, adjust=False).mean()
+    df['ema_slow'] = df['Close'].ewm(span=EMA_SLOW, adjust=False).mean()
+    df['ema_trend'] = df['Close'].ewm(span=EMA_TREND, adjust=False).mean()
+    df['ema_100'] = df['Close'].ewm(span=100, adjust=False).mean()
+    df['ema_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+
+    # Returns
+    df['returns'] = df['Close'].pct_change()
+    df['returns_5'] = df['Close'].pct_change(5)
+    df['returns_10'] = df['Close'].pct_change(10)
+
+    # Volatility
+    df['atr'] = calculate_atr(df, 14)
+    df['volatility'] = df['returns'].rolling(window=20).std()
+
+    # Oscillators
+    df['rsi'] = calculate_rsi(df, RSI_PERIOD)
+    df['rsi_fast'] = calculate_rsi(df, 7)
+    df['rsi_slow'] = calculate_rsi(df, 21)
+    df['macd'], df['macd_signal'], df['macd_hist'] = calculate_macd(df)
+    df['adx'] = calculate_adx(df, 14)
+    df['stoch_k'], df['stoch_d'] = calculate_stochastic(df, 14)
+
+    # Bollinger Bands
+    df['bb_middle'] = df['Close'].rolling(window=20).mean()
+    df['bb_std'] = df['Close'].rolling(window=20).std()
+    df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * 2)
+    df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * 2)
+    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / (df['bb_middle'] + 0.001)
+    df['bb_position'] = (df['Close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'] + 0.001)
+
+    # Volume
+    df['volume_sma'] = df['Volume'].rolling(window=20).mean()
+    df['volume_ratio'] = df['Volume'] / (df['volume_sma'] + 0.001)
+
+    # Candlestick structure
+    df['body_size'] = abs(df['Close'] - df['Open'])
+    df['upper_wick'] = df['High'] - df[['Open', 'Close']].max(axis=1)
+    df['lower_wick'] = df[['Open', 'Close']].min(axis=1) - df['Low']
+    df['wick_ratio'] = (df['upper_wick'] + df['lower_wick']) / (df['body_size'] + 0.001)
+
+    # EMA relationships
+    df['ema_fast_vs_slow'] = (df['ema_fast'] - df['ema_slow']) / (df['ema_slow'] + 0.001)
+    df['ema_slow_vs_trend'] = (df['ema_slow'] - df['ema_trend']) / (df['ema_trend'] + 0.001)
+    df['price_vs_ema_fast'] = (df['Close'] - df['ema_fast']) / (df['ema_fast'] + 0.001)
+    df['price_vs_ema_trend'] = (df['Close'] - df['ema_trend']) / (df['ema_trend'] + 0.001)
+
+    # Momentum
+    df['price_momentum'] = df['Close'] / (df['Close'].shift(10) + 0.001) - 1
+    df['rsi_momentum'] = df['rsi'] / (df['rsi'].shift(10) + 0.001) - 1
+
+    # Support/Resistance distances
+    df['high_50'] = df['High'].rolling(50).max()
+    df['low_50'] = df['Low'].rolling(50).min()
+    df['distance_to_high'] = (df['high_50'] - df['Close']) / (df['Close'] + 0.001)
+    df['distance_to_low'] = (df['Close'] - df['low_50']) / (df['Close'] + 0.001)
+
+    # Session features - gold has distinct patterns during different sessions
+    df['hour'] = df.index.hour
+    df['day_of_week'] = df.index.dayofweek
+    df['is_london'] = ((df['hour'] >= 2) & (df['hour'] < 5)).astype(int)
+    df['is_ny_open'] = ((df['hour'] >= 9) & (df['hour'] < 11)).astype(int)
+    df['is_power_hour'] = ((df['hour'] >= 14) & (df['hour'] < 15)).astype(int)
+
+    return df
+
+def create_labels(df, lookahead=12, profit_threshold=0.0008):
+    """Generate training labels using forward returns
+    NOTE: Labels are heuristic and noisy - model is trained to be conservative
+    Only use this on historical data (obvious look-ahead bias)"""
+    df = df.copy()
+    future_max = df['High'].shift(-lookahead).rolling(window=lookahead).max()
+    future_min = df['Low'].shift(-lookahead).rolling(window=lookahead).min()
+    current_price = df['Close']
+    upside = (future_max - current_price) / current_price
+    downside = (current_price - future_min) / current_price
+
+    labels = []
+    for up, down in zip(upside, downside):
+        if pd.notna(up) and pd.notna(down):
+            if up > profit_threshold and up > down * 1.5:
+                labels.append(1)  # long signal
+            elif down > profit_threshold and down > up * 1.5:
+                labels.append(-1)  # short signal
+            else:
+                labels.append(0)  # no trade
+        else:
+            labels.append(0)
+
+    df['label'] = labels
+    return df
+
+class PaperTradingEngine:
+    """Intraday paper execution loop for gold futures"""
+    def __init__(self):
+        self.capital = CAPITAL
+        self.equity = CAPITAL
+        self.position = None
+        self.trades = []
+        self.daily_pnl = 0
+        self.total_pnl = 0
+        self.daily_trades = 0
+        self.current_day = None
+
+        print("Paper trading engine initialized")
+        print(f"Starting capital: ${self.capital:,.2f}")
+        print(f"Max daily loss: {MAX_DAILY_LOSS*100:.0f}%, Max total DD: {MAX_TOTAL_LOSS*100:.0f}%\n")
+
+    def train_models(self):
+        """Train ensemble on last 2 weeks
+        TODO: Should retrain daily at open, not just once at startup"""
+        print("Fetching training data...")
+        end = datetime.now()
+        start = end - timedelta(days=14)
+
+        df = yf.download('GC=F', start=start, end=end, interval='5m', progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        print(f"Got {len(df)} 5min bars")
+
+        print("Building features...")
+        df = create_features(df)
+        df = create_labels(df)
+
+        # Feature selection
+        feature_cols = [col for col in df.columns if col not in 
+                       ['Open', 'High', 'Low', 'Close', 'Volume', 'label', 'Datetime', 'Date',
+                        'high_50', 'low_50', 'bb_upper', 'bb_lower', 'bb_middle']]
+
+        df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+        X = df[feature_cols].values
+        y = df['label'].values
+
+        # Quick 75/25 split for validation
+        split = int(len(X) * 0.75)
+        X_train = X[:split]
+        y_train = y[:split]
+
+        print("Training ensemble (RF + GB)...")
+        self.scaler = StandardScaler()
+        X_train_scaled = self.scaler.fit_transform(X_train)
+
+        # RF tends to overfit short windows but captures interactions well
+        self.rf = RandomForestClassifier(n_estimators=200, max_depth=12, random_state=42, n_jobs=-1)
+        self.rf.fit(X_train_scaled, y_train)
+
+        # GB smoother but slower to train
+        self.gb = GradientBoostingClassifier(n_estimators=150, max_depth=6, learning_rate=0.05, random_state=42)
+        self.gb.fit(X_train_scaled, y_train)
+
+        self.feature_cols = feature_cols
+
+        print("Models trained\n")
+
+    def get_live_data(self):
+        """Pull latest 5min candles from yfinance"""
+        end = datetime.now()
+        start = end - timedelta(days=1)
+
+        df = yf.download('GC=F', start=start, end=end, interval='5m', progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        return df
+
+    def get_prediction(self, df):
+        """Ensemble prediction - both models must agree"""
+        df = create_features(df)
+        df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+        row = df.iloc[-1]
+
+        try:
+            X = row[self.feature_cols].values.reshape(1, -1)
+            X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+            X_scaled = self.scaler.transform(X)
+
+            rf_pred = self.rf.predict(X_scaled)[0]
+            gb_pred = self.gb.predict(X_scaled)[0]
+            rf_proba = self.rf.predict_proba(X_scaled)[0]
+            gb_proba = self.gb.predict_proba(X_scaled)[0]
+
+            # Require agreement
+            prediction = rf_pred if rf_pred == gb_pred else 0
+
+            # Average probabilities
+            if prediction == 1:
+                confidence = (rf_proba[2] + gb_proba[2]) / 2
+            elif prediction == -1:
+                confidence = (rf_proba[0] + gb_proba[0]) / 2
+            else:
+                confidence = 0
+
+            return prediction, confidence, row
+        except Exception as e:
+            print(f"Prediction error: {e}")
+            return 0, 0, row
+
+    def check_exit(self, current_price, high, low, prediction, confidence):
+        """Check stops, targets, and ML reversals"""
+        if not self.position:
+            return False
+
+        if self.position['type'] == 'LONG':
+            if high >= self.position['target']:
+                self.exit_position(self.position['target'], 'TARGET')
+                return True
+            elif low <= self.position['stop']:
+                self.exit_position(self.position['stop'], 'STOP')
+                return True
+            elif prediction == -1 and confidence > 0.6:
+                # ML sees strong reversal signal
+                self.exit_position(current_price, 'ML_REVERSAL')
+                return True
+
+        elif self.position['type'] == 'SHORT':
+            if low <= self.position['target']:
+                self.exit_position(self.position['target'], 'TARGET')
+                return True
+            elif high >= self.position['stop']:
+                self.exit_position(self.position['stop'], 'STOP')
+                return True
+            elif prediction == 1 and confidence > 0.6:
+                self.exit_position(current_price, 'ML_REVERSAL')
+                return True
+
+        return False
+
+    def exit_position(self, exit_price, reason):
+        """Close position and log P&L"""
+        if self.position['type'] == 'LONG':
+            pnl = (exit_price - self.position['entry']) * CONTRACT_VALUE
+        else:
+            pnl = (self.position['entry'] - exit_price) * CONTRACT_VALUE
+
+        self.trades.append({
+            'entry_date': self.position['entry_date'],
+            'exit_date': datetime.now(),
+            'type': self.position['type'],
+            'entry': self.position['entry'],
+            'exit': exit_price,
+            'pnl': pnl,
+            'reason': reason,
+            'confidence': self.position['confidence']
+        })
+
+        self.daily_pnl += pnl
+        self.total_pnl += pnl
+        self.equity += pnl
+
+        result = "WIN" if pnl > 0 else "LOSS"
+        print(f"EXIT {self.position['type']}: ${exit_price:.2f} | P&L: ${pnl:+.2f} | {reason} ({result})")
+        print(f"  Equity: ${self.equity:,.2f} | Total: ${self.total_pnl:+,.2f}")
+
+        self.position = None
+
+    def enter_position(self, signal, confidence, current_price, atr):
+        """Enter with ATR-based stops"""
+        if signal == 1:
+            entry = current_price
+            stop = entry - (ATR_MULTIPLIER * atr)
+            target = entry + (TARGET_MULTIPLIER * atr)
+
+            self.position = {
+                'type': 'LONG',
+                'entry': entry,
+                'stop': stop,
+                'target': target,
+                'entry_date': datetime.now(),
+                'confidence': confidence
+            }
+
+            risk_dollars = (entry - stop) * CONTRACT_VALUE
+            print(f"LONG @ ${entry:.2f} | Stop: ${stop:.2f} | Target: ${target:.2f}")
+            print(f"  Confidence: {confidence:.1%} | Risk: ${risk_dollars:.2f}")
+
+            self.daily_trades += 1
+
+        elif signal == -1:
+            entry = current_price
+            stop = entry + (ATR_MULTIPLIER * atr)
+            target = entry - (TARGET_MULTIPLIER * atr)
+
+            self.position = {
+                'type': 'SHORT',
+                'entry': entry,
+                'stop': stop,
+                'target': target,
+                'entry_date': datetime.now(),
+                'confidence': confidence
+            }
+
+            risk_dollars = (stop - entry) * CONTRACT_VALUE
+            print(f"SHORT @ ${entry:.2f} | Stop: ${stop:.2f} | Target: ${target:.2f}")
+            print(f"  Confidence: {confidence:.1%} | Risk: ${risk_dollars:.2f}")
+
+            self.daily_trades += 1
+
+    def run(self):
+        """Main execution loop - checks every 60 seconds"""
+        self.train_models()
+
+        print("="*60)
+        print("Live paper trading - Press Ctrl+C to stop")
+        print("="*60)
+        print("Checking market every 60 seconds...\n")
+
+        try:
+            while True:
+                now = datetime.now()
+
+                # Daily reset
+                if self.current_day != now.date():
+                    if self.current_day:
+                        print(f"Daily P&L: ${self.daily_pnl:+.2f}\n")
+                    print(f"--- {now.date()} ---")
+                    self.current_day = now.date()
+                    self.daily_pnl = 0
+                    self.daily_trades = 0
+
+                # Risk checks
+                if self.daily_pnl <= -CAPITAL * MAX_DAILY_LOSS:
+                    print("Daily loss limit hit. Done for today.")
+                    time.sleep(3600)
+                    continue
+
+                if self.total_pnl <= -CAPITAL * MAX_TOTAL_LOSS:
+                    print("Total drawdown limit hit. Stopping.")
+                    break
+
+                if self.total_pnl >= CAPITAL * PROFIT_TARGET:
+                    print("Profit target reached.")
+                    break
+
+                if self.daily_trades >= 8:
+                    print("Daily trade limit reached (8 max)")
+                    time.sleep(3600)
+                    continue
+
+                # Trading hours: 8am-3pm EST only
+                hour = now.hour
+                if hour < 8 or hour >= 15:
+                    if self.position:
+                        df = self.get_live_data()
+                        current_price = float(df['Close'].iloc[-1])
+                        self.exit_position(current_price, 'EOD')
+                    time.sleep(60)
+                    continue
+
+                # Get latest bar
+                df = self.get_live_data()
+                prediction, confidence, row = self.get_prediction(df)
+
+                current_price = float(row['Close'])
+                high = float(row['High'])
+                low = float(row['Low'])
+                atr = float(row['atr'])
+
+                print(f"{now.strftime('%H:%M:%S')} | ${current_price:.2f} | Pred: {prediction:+d} | Conf: {confidence:.1%}")
+
+                # Check exits
+                if self.position:
+                    self.check_exit(current_price, high, low, prediction, confidence)
+
+                # Check entries
+                if not self.position and confidence > CONFIDENCE_THRESHOLD and atr >= 0.3:
+                    self.enter_position(prediction, confidence, current_price, atr)
+
+                time.sleep(60)
+
+        except KeyboardInterrupt:
+            print("\nStopped by user")
+            self.print_summary()
+
+    def print_summary(self):
+        """Print final stats"""
+        if not self.trades:
+            print("No trades taken.")
+            return
+
+        df = pd.DataFrame(self.trades)
+        winners = df[df['pnl'] > 0]
+        losers = df[df['pnl'] < 0]
+
+        print("\n" + "="*60)
+        print("Paper Trading Summary")
+        print("="*60)
+        print(f"Starting: ${CAPITAL:,.2f}")
+        print(f"Ending:   ${self.equity:,.2f}")
+        print(f"P&L:      ${self.total_pnl:+,.2f}")
+        print(f"Return:   {(self.total_pnl / CAPITAL * 100):+.2f}%")
+        print(f"\nTrades:   {len(df)}")
+        print(f"Wins:     {len(winners)} ({len(winners)/len(df)*100:.1f}%)")
+        print(f"Losses:   {len(losers)} ({len(losers)/len(df)*100:.1f}%)")
+
+        if len(winners) > 0 and len(losers) > 0:
+            avg_win = winners['pnl'].mean()
+            avg_loss = losers['pnl'].mean()
+            print(f"\nAvg Win:  ${avg_win:.2f}")
+            print(f"Avg Loss: ${avg_loss:.2f}")
+            profit_factor = abs(winners['pnl'].sum() / losers['pnl'].sum())
+            print(f"Profit Factor: {profit_factor:.2f}")
+
+        print("="*60)
+
+        print("\nTrade Log:")
+        print(df.to_string(index=False))
+
+        # Save to DB
+        conn = sqlite3.connect('gold_trades.db')
+        df.to_sql('paper_trades', conn, if_exists='replace', index=False)
+        conn.close()
+        print("\nSaved to gold_trades.db")
+
+if __name__ == "__main__":
+    engine = PaperTradingEngine()
+    engine.run()
