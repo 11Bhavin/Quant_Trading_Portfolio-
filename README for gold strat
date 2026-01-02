@@ -1,0 +1,99 @@
+# Gold Futures ML Trading System
+
+An ensemble machine learning system for trading gold futures (GC) on 5-minute timeframes using genetic algorithm–optimized parameters and ATR-based risk management [file:21].
+
+## Overview
+
+This system combines RandomForest and GradientBoosting classifiers to generate trading signals for gold futures contracts. Parameters were optimized using a genetic algorithm over 15 generations, achieving **110% return over 60 days** with a **63% win rate** and **1.72 profit factor** in backtesting [file:21].
+
+### Performance (Backtest)
+- **Total Return:** 110% over 60 days
+- **Win Rate:** 63%
+- **Profit Factor:** 1.72
+- **Starting Capital:** $10,000
+- **Contract Value:** $50 per point (GC micro contract)
+
+## Strategy Design
+
+### Feature Engineering
+
+Over 45 technical features per 5-minute candle including:
+
+**Trend Indicators:**
+- Multi-period EMAs (7, 18, 45, 100, 200)
+- EMA cross ratios and relative positioning
+- MACD and signal line
+
+**Momentum/Oscillators:**
+- RSI (12-period optimized, plus 7 and 21)
+- Stochastic %K and %D
+- ADX for trend strength
+- Multi-period returns (1, 5, 10 bars)
+
+**Volatility:**
+- ATR (14-period) for position sizing
+- 20-period rolling volatility
+- Bollinger Bands width and position
+
+**Price Action:**
+- Candlestick body/wick ratios
+- 50-period high/low distances
+- Volume ratios vs 20-day average
+
+**Session Features:**
+- Hour of day and day of week
+- London session (2-5am EST)
+- NY open (9-11am EST)
+- Power hour (2-3pm EST)
+
+Gold has distinct patterns during different trading sessions, so time-based features help capture that behavior.
+
+### Ensemble ML Model
+
+**Two classifiers vote on each signal:**
+- **RandomForest:** 200 trees, max depth 12
+- **GradientBoosting:** 150 estimators, learning rate 0.05
+
+Both models must agree for a trade signal. Confidence threshold set at 55% based on backtesting.
+
+**Label generation (training only):**
+- Looks ahead 12 bars (1 hour on 5min chart)
+- Labels as LONG if upside > 0.08% and upside > 1.5x downside
+- Labels as SHORT if downside > 0.08% and downside > 1.5x upside
+- Otherwise NO TRADE
+
+### Risk Management
+
+**Entry Logic:**
+- ML confidence > 55%
+- Both models agree on direction
+- ATR ≥ $0.30 (avoid low-volatility chop)
+- Max 8 trades per day
+
+**Exit Logic:**
+- **Stop loss:** Entry ± 1.8 × ATR
+- **Take profit:** Entry ± 4.0 × ATR (2.22 R:R ratio)
+- **ML reversal:** Exit if opposite signal with >60% confidence
+- **EOD:** Flatten all positions at 3pm EST
+
+**Account Limits:**
+- Max daily loss: 6% of capital
+- Max total drawdown: 12% of capital
+- Profit target: 10% gain
+
+### Genetic Algorithm Optimization
+
+Parameters were evolved over 15 generations with population size 20:
+- EMA periods
+- RSI period
+- ATR stop/target multipliers
+- Confidence threshold
+
+Fitness function: risk-adjusted return with profit factor weighting [file:21].
+
+## How to Run
+
+### Installation
+
+```bash
+pip install yfinance pandas numpy scikit-learn sqlite3
